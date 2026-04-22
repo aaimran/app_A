@@ -187,17 +187,15 @@ def parse_test_id(dataset: str) -> str:
                     qvf = float(qval) if qval is not None else 0.0
                 except Exception:
                     qvf = 0.0
-                # format f4.0 -> 'f40' and f4.6 -> 'f46' to match user's display
-                if qvf is not None:
-                    if abs(qvf - 0.0) < 1e-6:
-                        prefix = f"f{qn}0"
-                    elif abs(qvf - 0.6) < 1e-3 or abs(qvf - 4.6) < 1e-3:
-                        prefix = f"f{qn}6"
-                    else:
-                        # fallback: one decimal digit without dot
-                        prefix = f"f{qn}{int(round(qvf * 10))}"
-                else:
+                # Normalize F-style variants explicitly so F4.0 never drifts to f46.
+                qval_norm = str(qval).strip() if qval is not None else ""
+                if qval_norm in {"", "0", "0.0", "4.0"} or abs(qvf - 0.0) < 1e-6 or abs(qvf - 4.0) < 1e-6:
                     prefix = f"f{qn}0"
+                elif qval_norm in {"0.6", "4.6"} or abs(qvf - 0.6) < 1e-3 or abs(qvf - 4.6) < 1e-3:
+                    prefix = f"f{qn}6"
+                else:
+                    # fallback: keep one decimal place semantics without the dot
+                    prefix = f"f{qn}{int(round(qvf * 10))}"
             else:
                 m_qc = re.search(r"anelastic[-_]?Qc(?P<n>\d+)", dataset, flags=re.IGNORECASE)
                 if m_qc:
@@ -254,6 +252,33 @@ def parse_test_id(dataset: str) -> str:
 def parse_cg_value(dataset: str) -> str:
     m = CG_VALUE_RE.search(dataset)
     return m.group('val') if m else ""
+
+def selection_to_test_prefix(selection: str) -> str:
+    sel = str(selection or "").strip()
+    upper = sel.upper()
+    if upper in {"C4", "Q4"}:
+        return "c4"
+    if upper in {"C8", "Q8"}:
+        return "c8"
+    if upper == "F4.0":
+        return "f40"
+    if upper == "F4.6":
+        return "f46"
+    return upper.lower()
+
+def test_id_sort_key(test_id: str) -> Tuple[int, str]:
+    tid = str(test_id or "").lower()
+    if tid.startswith("e0"):
+        return (0, tid)
+    if tid.startswith("c4"):
+        return (1, tid)
+    if tid.startswith("c8"):
+        return (2, tid)
+    if tid.startswith("f40"):
+        return (3, tid)
+    if tid.startswith("f46"):
+        return (4, tid)
+    return (99, tid)
 
 def parse_variant_gamma(dataset: str) -> Tuple[Optional[str], Optional[str]]:
     m = ANELASTIC_GAMMA_RE.search(dataset)
@@ -1104,6 +1129,9 @@ def update_dataset_table(selected_station: str, selection_store: Dict, selected_
     default_selected = ["stencil", "domain", "pml", "response"]
     if selected_columns is None:
         selected_columns = default_selected
+    canonical_column_order = [value for _, value in all_columns]
+    selected_set = set(selected_columns)
+    selected_columns = [value for value in canonical_column_order if value in selected_set]
     # column_selector is now in the main layout
 
     stencil_legend = html.Div([
@@ -1222,7 +1250,10 @@ def update_dataset_table(selected_station: str, selection_store: Dict, selected_
             options=q_options,
             value=q_value,
             inputStyle={"marginRight": "6px"},
-            labelStyle={"display": "none"},
+            # Keep the label wrapper visible so the checkbox input still renders
+            # consistently across Dash/Bootstrap versions. The labels themselves
+            # are already empty strings, so no extra text is shown.
+            labelStyle={"display": "inline-block", "marginBottom": "0"},
             style={"display": "flex", "flexDirection": "row", "gap": "8px", "alignItems": "center"}
         )
 
@@ -1242,9 +1273,20 @@ def update_dataset_table(selected_station: str, selection_store: Dict, selected_
             info_sample = parse_dataset_info(Path(sample_path))
             sample_dataset = info_sample.dataset if info_sample else ""
 
-        # Merge test ids collected for this base (strip any _cg-... suffix to lookup)
+        # Build test ids directly from all datasets in this row so the column
+        # always reflects every available response for the grouped configuration.
         base_nocg = re.sub(r"_cg-[^_]+$", "", base)
-        test_ids = sorted(list(base_to_testids.get(base_nocg, set())))
+        test_ids = []
+        seen_test_ids = set()
+        for path_list in variants.values():
+            for p in path_list:
+                info_variant = parse_dataset_info(Path(p))
+                dataset_variant = info_variant.dataset if info_variant else ""
+                test_id = parse_test_id(dataset_variant)
+                if test_id and test_id not in seen_test_ids:
+                    seen_test_ids.add(test_id)
+                    test_ids.append(test_id)
+        test_ids.sort(key=test_id_sort_key)
         test_val = ",".join(test_ids) if test_ids else (parse_test_id(sample_dataset) or "-")
         cg_val = base_to_cg.get(base_nocg, "")
 
@@ -1369,58 +1411,19 @@ def update_plot(station, plots_selected, plot_grid_mode, elastic_values, anelast
             if anel_sel:
                 p_list = variants.get(VARIANT_ANELASTIC, [])
                 for qsel in (anel_sel if isinstance(anel_sel, list) else [anel_sel]):
-                    # find a path that matches the requested Q
+                    # Match the selected response against the normalized dataset id
+                    # used everywhere else in the app (c4, c8, f40, f46).
                     found = None
+                    expected_prefix = selection_to_test_prefix(qsel)
                     for p in p_list:
                         try:
                             pi = parse_dataset_info(Path(p))
                             ds = pi.dataset if pi else p
                         except Exception:
                             ds = p
-                        # Match a requested Q selection against dataset tokens.
-                        s_qsel = str(qsel)
-                        # F-style selection (F4.0 / F4.6)
-                        m_fsel = re.search(r"F(?P<n>\d+)(?:[._-]?(?P<val>\d+(?:\.\d+)?))?", s_qsel, flags=re.IGNORECASE)
-                        if m_fsel:
-                            n = m_fsel.group('n')
-                            val = m_fsel.group('val') or ''
-                            # Build a list of acceptable numeric suffixes for F selections.
-                            alts = []
-                            if val:
-                                try:
-                                    fv = float(val)
-                                except Exception:
-                                    fv = None
-                                # For F4.6 accept both 0.6 and 4.6 representations
-                                if n == '4' and (fv is not None) and (abs(fv - 0.6) < 1e-3 or abs(fv - 4.6) < 1e-3):
-                                    alts = ['0.6', '4.6']
-                                # For F4.0 accept 0 or 0.0
-                                elif n == '4' and (fv is not None) and abs(fv - 0.0) < 1e-3:
-                                    alts = ['0', '0.0']
-                                else:
-                                    alts = [val]
-                            else:
-                                # No explicit numeric part in selection: accept any QfN variant
-                                alts = ['']
-
-                            if alts == ['']:
-                                pat = rf"anelastic[-_]?Qf{n}"
-                            else:
-                                escaped = '|'.join(re.escape(a) for a in alts)
-                                pat = rf"anelastic[-_]?Qf{n}(?:[-_](?:{escaped}))"
-                            if re.search(pat, ds, flags=re.IGNORECASE):
-                                found = p
-                        else:
-                            # numeric-only matching for C/Q selections (C4/Q4/C8/Q8)
-                            qnum_m = re.search(r"(\d+)", s_qsel)
-                            if qnum_m:
-                                qnum = qnum_m.group(1)
-                                pat = rf"anelastic[-_]?((?:Q[cC])|Q|[cC]){qnum}"
-                                if re.search(pat, ds, flags=re.IGNORECASE):
-                                    found = p
-                            else:
-                                if re.search(rf"anelastic[-_]?{re.escape(s_qsel)}", ds, flags=re.IGNORECASE):
-                                    found = p
+                        if parse_test_id(ds).lower().startswith(expected_prefix):
+                            found = p
+                            break
                     # fallback to first anelastic path if not found
                     if not found and p_list:
                         found = p_list[0]
@@ -1563,6 +1566,6 @@ def update_plot(station, plots_selected, plot_grid_mode, elastic_values, anelast
 # --- 6. EXECUTION ---
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8051))
+    port = int(os.environ.get("PORT", 8055))
     host = os.environ.get("HOST", "0.0.0.0")
     app.run(host=host, port=port, debug=False)
